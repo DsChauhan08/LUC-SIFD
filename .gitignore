@@ -1,0 +1,13 @@
+__pycache__/
+.ruff_cache/
+*.pyc
+mock/
+mock_easy/
+mock_hard/
+deep_mock/
+*.pt
+*.pkl
+*.csv
+*.npy
+*.png
+external/
