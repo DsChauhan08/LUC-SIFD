@@ -9,6 +9,7 @@ import os
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 
 from deep_local_copymove import PairDataset, TinyUNet, mask_f1_np, set_limits, set_seed
@@ -24,15 +25,41 @@ def collect_ids(img_dir: str, mask_dir: str):
     return ids
 
 
+def apply_flip(x: torch.Tensor, mode: int) -> torch.Tensor:
+    if mode == 0:
+        return x
+    if mode == 1:
+        return torch.flip(x, dims=[3])
+    if mode == 2:
+        return torch.flip(x, dims=[2])
+    if mode == 3:
+        return torch.flip(x, dims=[2, 3])
+    raise ValueError(mode)
+
+
+class CachedPairDataset(Dataset):
+    def __init__(self, base: PairDataset):
+        self.base = base
+        self.cache = [base[i] for i in range(len(base))]
+
+    def __len__(self) -> int:
+        return len(self.cache)
+
+    def __getitem__(self, idx: int):
+        return self.cache[idx]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--img-dir", default="deep_mock/images")
     ap.add_argument("--mask-dir", default="deep_mock/masks")
     ap.add_argument("--img-size", type=int, default=128)
-    ap.add_argument("--epochs", type=int, default=6)
+    ap.add_argument("--epochs", type=int, default=12)
     ap.add_argument("--batch-size", type=int, default=12)
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--tta", type=int, default=4, choices=[1, 2, 4])
+    ap.add_argument("--cached", action="store_true")
     args = ap.parse_args()
 
     set_limits(args.threads)
@@ -53,6 +80,9 @@ def main() -> None:
 
         tr_ds = PairDataset(tr_ids, args.img_dir, args.mask_dir, args.img_size, True)
         va_ds = PairDataset(va_ids, args.img_dir, args.mask_dir, args.img_size, False)
+        if args.cached:
+            tr_ds = CachedPairDataset(tr_ds)
+            va_ds = CachedPairDataset(va_ds)
         tr_dl = DataLoader(
             tr_ds, batch_size=args.batch_size, shuffle=True, num_workers=0
         )
@@ -66,7 +96,7 @@ def main() -> None:
         for _ep in range(args.epochs):
             model.train()
             for x, y, c in tr_dl:
-                mlog, clog = model(x)
+                mlog, auxlog, clog = model(x)
                 bce = F.binary_cross_entropy_with_logits(mlog, y)
                 p = torch.sigmoid(mlog)
                 dice = (
@@ -76,8 +106,17 @@ def main() -> None:
                         / ((p + y).sum((1, 2, 3)) + 1e-6)
                     ).mean()
                 )
+                bce_aux = F.binary_cross_entropy_with_logits(auxlog, y)
+                p_aux = torch.sigmoid(auxlog)
+                dice_aux = (
+                    1.0
+                    - (
+                        (2 * (p_aux * y).sum((1, 2, 3)) + 1e-6)
+                        / ((p_aux + y).sum((1, 2, 3)) + 1e-6)
+                    ).mean()
+                )
                 cls = F.binary_cross_entropy_with_logits(clog, c)
-                loss = 0.8 * (bce + dice) + 0.2 * cls
+                loss = 0.65 * (bce + dice) + 0.20 * (bce_aux + dice_aux) + 0.15 * cls
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 opt.step()
@@ -88,9 +127,25 @@ def main() -> None:
         s_f1 = []
         with torch.no_grad():
             for x, y, c in va_dl:
-                mlog, clog = model(x)
+                modes = [0]
+                if args.tta >= 2:
+                    modes = [0, 1]
+                if args.tta >= 4:
+                    modes = [0, 1, 2, 3]
+
+                mlog_acc = None
+                cprob = 0.0
+                for m in modes:
+                    xx = apply_flip(x, m)
+                    ml, _aux, cl = model(xx)
+                    ml = apply_flip(ml, m)
+                    mlog_acc = ml if mlog_acc is None else (mlog_acc + ml)
+                    cprob += torch.sigmoid(cl)
+
+                mlog = mlog_acc / float(len(modes))
+                clog = cprob / float(len(modes))
                 pm = (torch.sigmoid(mlog) > 0.5).float().numpy()
-                pc = (torch.sigmoid(clog) > 0.5).float().numpy().reshape(-1)
+                pc = (clog > 0.5).float().numpy().reshape(-1)
                 yy = y.numpy()
                 cc = c.numpy().reshape(-1)
                 c_true.extend(cc.tolist())
